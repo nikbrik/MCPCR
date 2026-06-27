@@ -13,6 +13,7 @@ import datetime as dt
 import json
 import os
 import sys
+import secrets
 import time
 import urllib.error
 import urllib.parse
@@ -29,6 +30,8 @@ GITHUB_USER_AGENT = "mcp-server-github-demo"
 DEFAULT_STORAGE_DIR = Path(__file__).resolve().parent / ".data" / "day18"
 DEFAULT_WATCH_REPO = "nikbrik/coding_writer"
 DEFAULT_INTERVAL_SECONDS = 300
+SEARCH_DEFAULT_LIMIT = 5
+SEARCH_MAX_LIMIT = 10
 
 
 GITHUB_REPO_INFO_TOOL: dict[str, Any] = {
@@ -90,11 +93,68 @@ GITHUB_WATCH_HISTORY_TOOL: dict[str, Any] = {
     },
 }
 
+GITHUB_SEARCH_REPOS_TOOL: dict[str, Any] = {
+    "name": "github_search_repos",
+    "description": "Search public GitHub repositories by query and save artifacts for the next pipeline step.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "GitHub repository search query.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of repositories to store.",
+                "minimum": 1,
+                "maximum": SEARCH_MAX_LIMIT,
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+
+GITHUB_MAKE_REPORT_TOOL: dict[str, Any] = {
+    "name": "github_make_report",
+    "description": "Build a short report from a previous day19 search artifact and persist it.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "search_id": {
+                "type": "string",
+                "description": "search_id from github_search_repos",
+            },
+        },
+        "required": ["search_id"],
+        "additionalProperties": False,
+    },
+}
+
+SAVE_REPORT_TOOL: dict[str, Any] = {
+    "name": "save_report_to_file",
+    "description": "Persist a report artifact to markdown file and return path.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "report_id": {
+                "type": "string",
+                "description": "report_id from github_make_report",
+            },
+        },
+        "required": ["report_id"],
+        "additionalProperties": False,
+    },
+}
+
 TOOLS = [
     GITHUB_REPO_INFO_TOOL,
     GITHUB_WATCH_STATUS_TOOL,
     GITHUB_WATCH_SUMMARY_TOOL,
     GITHUB_WATCH_HISTORY_TOOL,
+    GITHUB_SEARCH_REPOS_TOOL,
+    GITHUB_MAKE_REPORT_TOOL,
+    SAVE_REPORT_TOOL,
 ]
 
 
@@ -385,8 +445,201 @@ def storage_paths(storage_dir: Path) -> dict[str, Path]:
     }
 
 
+def day19_storage_paths(storage_dir: Path) -> dict[str, Path]:
+    return {
+        "searches": storage_dir / "searches",
+        "reports": storage_dir / "reports",
+        "output": storage_dir / "output",
+        "pipeline_runs": storage_dir / "pipeline_runs.jsonl",
+    }
+
+
 def load_runs(storage_dir: Path) -> list[dict[str, Any]]:
     return read_jsonl(storage_paths(storage_dir)["runs"])
+
+
+def new_pipeline_id(prefix: str) -> str:
+    return f"{prefix}_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
+
+
+def parse_search_limit(raw: Any) -> int:
+    if raw is None:
+        return SEARCH_DEFAULT_LIMIT
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError("limit must be an integer")
+    if raw < 1 or raw > SEARCH_MAX_LIMIT:
+        raise ValueError("limit must be between 1 and 10")
+    return raw
+
+
+def parse_non_empty_string(raw: Any, field_name: str) -> str:
+    if not isinstance(raw, str):
+        raise ValueError(f"{field_name} must be a string")
+    value = raw.strip()
+    if not value:
+        raise ValueError(f"{field_name} must not be empty")
+    return value
+
+
+def summarize_search_repo(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "full_name": payload.get("full_name"),
+        "description": payload.get("description"),
+        "html_url": payload.get("html_url"),
+        "language": payload.get("language"),
+        "stars": payload.get("stargazers_count"),
+        "forks": payload.get("forks_count"),
+        "open_issues": payload.get("open_issues_count"),
+        "updated_at": payload.get("updated_at"),
+    }
+
+
+def write_day19_run(storage_dir: Path, event: dict[str, Any]) -> None:
+    append_jsonl(day19_storage_paths(storage_dir)["pipeline_runs"], {
+        "id": new_pipeline_id("run"),
+        "created_at": iso_time(),
+        **event,
+    })
+
+
+def call_github_search_repos(storage_dir: Path, arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        query = parse_non_empty_string(arguments.get("query"), "query")
+        limit = parse_search_limit(arguments.get("limit"))
+    except ValueError as exc:
+        return tool_result({"error": str(exc)}, is_error=True)
+    encoded_query = urllib.parse.quote(query, safe="")
+    url = f"{GITHUB_API_BASE_URL}/search/repositories?q={encoded_query}&sort=stars&order=desc&per_page={limit}"
+    try:
+        payload = fetch_github_json(url)
+    except GitHubApiError as exc:
+        return tool_result({"error": exc.message, "query": query, "status": exc.status, "api_url": url}, is_error=True)
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return tool_result({"error": "GitHub search API returned unexpected payload", "query": query, "api_url": url}, is_error=True)
+    repos = [summarize_search_repo(item) for item in items[:limit]]
+    search_id = new_pipeline_id("search")
+    search_payload = {
+        "search_id": search_id,
+        "created_at": iso_time(),
+        "api_url": url,
+        "query": query,
+        "limit": limit,
+        "total_count": payload.get("total_count"),
+        "repositories": repos,
+    }
+    paths = day19_storage_paths(storage_dir)
+    atomic_write_json(paths["searches"] / f"{search_id}.json", search_payload)
+    write_day19_run(storage_dir, {
+        "tool": GITHUB_SEARCH_REPOS_TOOL["name"],
+        "search_id": search_id,
+        "query": query,
+        "repo_count": len(repos),
+    })
+    return tool_result({
+        "search_id": search_id,
+        "query": query,
+        "limit": limit,
+        "returned": len(repos),
+        "total_count": payload.get("total_count", 0),
+    })
+
+
+def call_github_make_report(storage_dir: Path, arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        search_id = parse_non_empty_string(arguments.get("search_id"), "search_id")
+    except ValueError as exc:
+        return tool_result({"error": str(exc)}, is_error=True)
+    search_path = day19_storage_paths(storage_dir)["searches"] / f"{search_id}.json"
+    if not search_path.exists():
+        return tool_result({"error": f"search_id {search_id} not found"}, is_error=True)
+    try:
+        search_payload = read_json(search_path, {})
+    except StorageError as exc:
+        return tool_result({"error": str(exc)}, is_error=True)
+    repos = search_payload.get("repositories")
+    if not isinstance(repos, list):
+        return tool_result({"error": f"invalid search artifact: {search_id}"}, is_error=True)
+    report_id = new_pipeline_id("report")
+    report = {
+        "report_id": report_id,
+        "search_id": search_id,
+        "created_at": iso_time(),
+        "query": search_payload.get("query"),
+        "repo_count": len(repos),
+        "top_repo": repos[0] if repos else None,
+    }
+    report_text = [
+        "# GitHub Report",
+        "",
+        f"search_id: {search_id}",
+        f"query: {search_payload.get('query', '')}",
+        f"total_count: {search_payload.get('total_count', len(repos))}",
+        f"returned: {len(repos)}",
+        "",
+        "## Repositories",
+        "",
+        "| full_name | stars | language | description |",
+        "| --- | --- | --- | --- |",
+    ]
+    for item in repos:
+        if not isinstance(item, dict):
+            continue
+        description = (item.get("description") or "")
+        if description:
+            description = description.replace("|", "•")
+        report_text.append(
+            "| {full_name} | {stars} | {language} | {description} |".format(
+                full_name=item.get("full_name", ""),
+                stars=item.get("stars", 0),
+                language=item.get("language", "") or "",
+                description=description,
+            )
+        )
+    report_payload = {"report_text": "\n".join(report_text), "report": report}
+    atomic_write_json(day19_storage_paths(storage_dir)["reports"] / f"{report_id}.json", report_payload)
+    write_day19_run(storage_dir, {
+        "tool": GITHUB_MAKE_REPORT_TOOL["name"],
+        "search_id": search_id,
+        "report_id": report_id,
+        "repo_count": len(repos),
+    })
+    return tool_result({
+        "report_id": report_id,
+        "search_id": search_id,
+        "query": search_payload.get("query"),
+        "repo_count": len(repos),
+    })
+
+
+def call_save_report_to_file(storage_dir: Path, arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        report_id = parse_non_empty_string(arguments.get("report_id"), "report_id")
+    except ValueError as exc:
+        return tool_result({"error": str(exc)}, is_error=True)
+    report_payload_path = day19_storage_paths(storage_dir)["reports"] / f"{report_id}.json"
+    if not report_payload_path.exists():
+        return tool_result({"error": f"report_id {report_id} not found"}, is_error=True)
+    report_payload = read_json(report_payload_path, {})
+    if not report_payload:
+        return tool_result({"error": f"report_id {report_id} has empty payload"}, is_error=True)
+    output_path = day19_storage_paths(storage_dir)["output"] / f"{report_id}.md"
+    ensure_storage_dir(output_path.parent)
+    text = report_payload.get("report_text")
+    if not isinstance(text, str) or not text.strip():
+        return tool_result({"error": f"report_id {report_id} is missing markdown body"}, is_error=True)
+    output_path.write_text(text, encoding="utf-8")
+    write_day19_run(storage_dir, {
+        "tool": SAVE_REPORT_TOOL["name"],
+        "report_id": report_id,
+        "path": str(output_path),
+    })
+    return tool_result({
+        "path": str(output_path),
+        "report_id": report_id,
+    })
 
 
 def sample_delta(first: dict[str, Any] | None, latest: dict[str, Any] | None) -> dict[str, Any]:
@@ -605,6 +858,16 @@ def call_github_watch_history(storage_dir: Path, arguments: dict[str, Any]) -> d
     )
 
 
+def day19_tool_output_files(storage_dir: Path) -> dict[str, Any]:
+    paths = day19_storage_paths(storage_dir)
+    return {
+        "searches": str(paths["searches"]),
+        "reports": str(paths["reports"]),
+        "output": str(paths["output"]),
+        "pipeline_runs": str(paths["pipeline_runs"]),
+    }
+
+
 def handle_initialize(message_id: Any, params: dict[str, Any]) -> dict[str, Any]:
     return success(
         message_id,
@@ -631,6 +894,12 @@ def handle_tools_call(message_id: Any, params: dict[str, Any], storage_dir: Path
         return success(message_id, call_github_watch_summary(storage_dir))
     if name == GITHUB_WATCH_HISTORY_TOOL["name"]:
         return success(message_id, call_github_watch_history(storage_dir, arguments))
+    if name == GITHUB_SEARCH_REPOS_TOOL["name"]:
+        return success(message_id, call_github_search_repos(storage_dir, arguments))
+    if name == GITHUB_MAKE_REPORT_TOOL["name"]:
+        return success(message_id, call_github_make_report(storage_dir, arguments))
+    if name == SAVE_REPORT_TOOL["name"]:
+        return success(message_id, call_save_report_to_file(storage_dir, arguments))
     return error(message_id, -32602, f"Unknown tool: {name}")
 
 

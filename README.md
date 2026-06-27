@@ -230,3 +230,49 @@ python3 scripts/smoke_day18_watch.py nikbrik/coding_writer
 
 The smoke runs the worker for two ticks, verifies persisted files, then starts MCP stdio mode and calls `github_watch_status`, `github_watch_summary`, and `github_watch_history`.
 
+## День 19: MCP tool composition
+
+Добавлены tools в один же MCP server:
+
+- `github_search_repos`
+- `github_make_report`
+- `save_report_to_file`
+
+Эти tools реализуют цепочку `search -> report -> save` через persisted artifacts.
+
+Путь хранения Day 19:
+
+- `.data/day19/searches/<search_id>.json`
+- `.data/day19/reports/<report_id>.json`
+- `.data/day19/output/<report_id>.md`
+- `.data/day19/pipeline_runs.jsonl`
+
+Проверка через smoke:
+
+```bash
+python3 -m py_compile server.py scripts/smoke_day19_pipeline.py
+python3 scripts/smoke_day19_pipeline.py
+```
+
+Между руками `coding_writer` это выглядит как normal TUI/chat запрос к одному MCP:
+
+```bash
+cd /Users/nikita/code/coding_writer
+cw mcp add day19-github-tools \
+  --command python3 \
+  --arg /Users/nikita/Documents/mcp-server/server.py \
+  --arg --storage-dir \
+  --arg /Users/nikita/Documents/mcp-server/.data/day19 \
+  --allow-tool github_search_repos \
+  --allow-tool github_make_report \
+  --allow-tool save_report_to_file \
+  --auto-approve
+
+cw chat --once --input "Найди GitHub репозитории про mcp server python, сделай короткий отчет и сохрани его в файл."
+```
+
+Критерий доказательства для Day 19: в transcript/audit есть последовательные `mcp_tool_call` и `mcp_tool_result` на:
+
+1. `github_search_repos`
+2. `github_make_report`
+3. `save_report_to_file`
